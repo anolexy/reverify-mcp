@@ -34,6 +34,7 @@ function collect(messages) {
   let tokens = null;
   let first = null;
   let last = null;
+  let model = null;                 // the session's current model: the successor must not fall back to the server default
   for (const entry of messages || []) {
     const info = entry.info || entry;
     const parts = entry.parts || [];
@@ -42,6 +43,7 @@ function collect(messages) {
       tokens = typeof t.total === "number" && t.total > 0
         ? t.total
         : (t.input || 0) + (t.output || 0) + ((t.cache && t.cache.read) || 0);
+      if (info.providerID && info.modelID) model = { providerID: info.providerID, modelID: info.modelID };
     } else if (info.role === "user") {
       const text = parts.filter((p) => p.type === "text" && typeof p.text === "string").map((p) => p.text).join("\n").trim();
       if (text && !text.startsWith("<")) {
@@ -50,34 +52,41 @@ function collect(messages) {
       }
     }
   }
-  return { tokens, first, last };
+  return { tokens, first, last, model };
 }
 
 export const ReverifyRollover = async ({ client, directory }) => {
   const asked = new Set();          // sessions we already asked for a hand-off (stop_hook_active)
   const busy = new Set();
   let openingForNewSession = null;  // set while we wait for the TUI to create the successor
+  let modelForNewSession = null;
 
-  async function sendOpening(sessionID, opening) {
-    await client.session.prompt({ path: { id: sessionID }, body: { parts: [{ type: "text", text: opening }] } });
+  async function sendOpening(sessionID, opening, model) {
+    const body = { parts: [{ type: "text", text: opening }] };
+    if (model) body.model = model;
+    await client.session.prompt({ path: { id: sessionID }, body });
   }
 
-  async function rollover(fromSessionID, opening) {
+  async function rollover(fromSessionID, opening, model) {
     openingForNewSession = opening;
-    let switched = false;
+    modelForNewSession = model || null;
     try {
+      // With a TUI attached this opens a fresh session and the `session.created` handler below sends
+      // the opening. Headless (`opencode serve` / `run --attach`) the endpoint still answers without
+      // error but no TUI acts on it (measured 2026-09-06), so do not trust the call: wait for the
+      // handler to consume the opening, and create the successor here when it does not.
       await client.tui.executeCommand({ body: { command: "session_new" } });
-      switched = true;
     } catch (_err) {
-      switched = false;
+      // no TUI at all
     }
-    if (!switched) {
-      // headless (opencode run / serve): create the successor ourselves
-      const created = await client.session.create({ body: { title: "rollover continuation" } });
-      const id = created && created.data && created.data.id;
-      openingForNewSession = null;
-      if (id) await sendOpening(id, opening);
+    for (let waited = 0; waited < 3000 && openingForNewSession; waited += 100) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    if (!openingForNewSession) return;
+    openingForNewSession = null;
+    const created = await client.session.create({ body: { title: "rollover continuation" } });
+    const id = created && created.data && created.data.id;
+    if (id) await sendOpening(id, opening, model);
   }
 
   return {
@@ -89,7 +98,7 @@ export const ReverifyRollover = async ({ client, directory }) => {
           if (id && !info.parentID) {
             const opening = openingForNewSession;
             openingForNewSession = null;
-            await sendOpening(id, opening);
+            await sendOpening(id, opening, modelForNewSession);
           }
           return;
         }
@@ -101,24 +110,32 @@ export const ReverifyRollover = async ({ client, directory }) => {
           const got = await client.session.get({ path: { id: sessionID } });
           const session = got && got.data;
           if (!session || session.parentID) return;
-          const listed = await client.session.messages({ path: { id: sessionID } });
-          const { tokens, first, last } = collect(listed && listed.data);
-          const result = await callGuard({
-            session_id: sessionID,
-            cwd: session.directory || directory,
-            tokens,
-            first_user_message: first,
-            last_user_message: last,
-            stop_hook_active: asked.has(sessionID),
-          });
-          if (result.action === "prompt" && result.text) {
-            asked.add(sessionID);
-            await client.session.prompt({ path: { id: sessionID }, body: { parts: [{ type: "text", text: result.text }] } });
-          } else if (result.action === "rollover" && result.opening) {
+          // Two passes at most: the guard asks for a hand-off, the model writes it, the guard issues the
+          // receipt. `session.prompt` returns only when the prompted turn is over, so the `session.idle`
+          // that ends that turn arrives while this handler is still running and is dropped by `busy`;
+          // the second pass replaces it (measured 2026-09-06: one pass left the session stuck at
+          // "pending" with a valid hand-off on disk).
+          for (let pass = 0; pass < 2; pass++) {
+            const listed = await client.session.messages({ path: { id: sessionID } });
+            const { tokens, first, last, model } = collect(listed && listed.data);
+            const result = await callGuard({
+              session_id: sessionID,
+              cwd: session.directory || directory,
+              tokens,
+              first_user_message: first,
+              last_user_message: last,
+              stop_hook_active: asked.has(sessionID),
+            });
+            if (result.action === "prompt" && result.text) {
+              asked.add(sessionID);
+              await client.session.prompt({ path: { id: sessionID }, body: { parts: [{ type: "text", text: result.text }] } });
+              continue;
+            }
             asked.delete(sessionID);
-            await rollover(sessionID, result.opening);
-          } else {
-            asked.delete(sessionID);
+            if (result.action === "rollover" && result.opening) {
+              await rollover(sessionID, result.opening, model);
+            }
+            break;
           }
         } finally {
           busy.delete(sessionID);

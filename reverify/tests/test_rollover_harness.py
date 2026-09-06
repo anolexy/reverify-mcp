@@ -550,6 +550,29 @@ class DoctorAndInstructions(Base):
         self.assertEqual(calls, [calls[0]])                  # spawned once, not twice
         self.assertEqual(rh.load_state("sess-1", 200_000)["successor"], "succ1")
 
+    def test_doctor_downgrades_old_receipts_to_a_note_once_the_successor_is_on(self):
+        os.environ[rh.ENV_SETTINGS] = str(self.root / "settings.json")
+        with redirect_stdout(io.StringIO()):
+            rh.run_install(["--harness", "claude"])
+        settings_file = self.root / "settings.json"
+        settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        settings.setdefault("env", {})[rh.ClaudeHarness.SUCCESSOR_ENV] = "bg"
+        settings_file.write_text(json.dumps(settings), encoding="utf-8")
+        events = rh.state_dir() / "events.jsonl"
+        events.parent.mkdir(parents=True, exist_ok=True)
+        events.write_text(json.dumps({"at": "2026-09-05T07:50:14Z", "event": "receipt", "harness": "claude", "session": "s1",
+                                      "tokens": 815959, "launch_id": None, "inline": False}) + "\n", encoding="utf-8")
+        rows = {r["harness"]: r for r in rh.doctor_report()}
+        self.assertTrue(rows["claude"]["successor"])
+        self.assertEqual(rows["claude"]["problems"], [])
+        self.assertIn("1 earlier hand-off receipt(s) had no successor (peak 816k", " ".join(rows["claude"]["notes"]))
+        self.assertNotIn("successor", rows["codex"])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rh.run_doctor([])
+        self.assertIn("successor: on", out.getvalue())
+        self.assertIn("     . 1 earlier hand-off receipt", out.getvalue())
+
     def test_doctor_counts_receipt_with_successor_as_consumed(self):
         events = rh.state_dir() / "events.jsonl"
         events.parent.mkdir(parents=True, exist_ok=True)

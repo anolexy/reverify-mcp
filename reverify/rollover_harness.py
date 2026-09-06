@@ -2045,7 +2045,21 @@ def doctor_report() -> List[Dict[str, Any]]:
                     row["problems"].append(f"{event}: {why}")
         unconsumed = unconsumed_receipts(name)
         row["unconsumed_receipts"] = unconsumed
-        if unconsumed["count"]:
+        successor_on = False
+        if name == "claude":
+            try:
+                env_block = _load_json_file(settings_path()).get("env") or {}
+            except Exception:
+                env_block = {}
+            successor_on = str(env_block.get(ClaudeHarness.SUCCESSOR_ENV, "")).strip().lower() == "bg"
+            row["successor"] = successor_on
+        if unconsumed["count"] and successor_on:
+            # the remedy is in place; the old receipts are history, not a current fault
+            row.setdefault("notes", []).append(
+                f"{unconsumed['count']} earlier hand-off receipt(s) had no successor (peak {fmt_k(unconsumed['peak'])}, "
+                f"last {unconsumed['last_at']}); {ClaudeHarness.SUCCESSOR_ENV}=bg is set now, so each new receipt "
+                "starts a fresh `claude --bg` session in the project directory.")
+        elif unconsumed["count"]:
             row["problems"].append(
                 f"{unconsumed['count']} hand-off receipt(s) went to sessions the launcher did not start "
                 f"(peak {fmt_k(unconsumed['peak'])}, last {unconsumed['last_at']}); nothing ended those sessions, so with "
@@ -2073,10 +2087,15 @@ def run_doctor(argv: List[str]) -> int:
     for row in rows:
         installed = row["hooks"] and all(v for v in row["hooks"].values())
         mark = "ok" if installed and not row["problems"] else ("--" if not row["on_path"] and not installed else "!!")
+        extra = ""
+        if "successor" in row:
+            extra = f"  successor: {'on' if row['successor'] else 'off'}"
         print(f"{mark:2} {row['harness']:<9} on PATH: {'yes' if row['on_path'] else 'no ':<3}  hooks: {'yes' if installed else 'no ':<3}  "
-              f"native compaction off: {'yes' if row['compaction_off'] else 'no'}")
+              f"native compaction off: {'yes' if row['compaction_off'] else 'no'}{extra}")
         for problem in row["problems"]:
             print(f"     - {problem}")
+        for note in row.get("notes", []):
+            print(f"     . {note}")
     events = state_dir() / "events.jsonl"
     if events.is_file():
         tail = events.read_text(encoding="utf-8").splitlines()[-3:]

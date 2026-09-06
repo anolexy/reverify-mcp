@@ -27,6 +27,16 @@ All notable changes to this project are documented here.
   the remedy. The test suites clear the opt-in from the environment first: run inside a Claude Code
   session (whose settings `env` reaches every shell), a receipt in a test used to start a real
   `claude --bg` session.
+- **OpenCode plugin: the receipt step actually runs.** The plugin asked the model for the hand-off
+  and waited for that turn, but the `session.idle` that ends the turn arrived while the handler was
+  still busy and was dropped, so the session stayed at "pending" with a valid hand-off on disk
+  (first real end-to-end run, 2026-09-06). The handler now takes the second guard step itself after
+  the prompted turn returns: hand-off, receipt, fresh session. Headless (`opencode serve`,
+  `run --attach`) the TUI "new session" command answers without doing anything, so the plugin waits
+  for the new session briefly and creates it itself when none appears, and the successor is
+  prompted with the old session's model rather than the server default.
+- **`doctor` shows the successor state** (`successor: on|off` on the Claude row) and, once it is on,
+  reports earlier receipts that had no successor as a note instead of a failure.
 - **Launcher + Remote Control**: `reverify rollover claude --remote-control` gives the flag a name
   when you did not, so the opening prompt is never registered as the session's name.
 
