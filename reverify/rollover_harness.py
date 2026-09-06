@@ -782,10 +782,23 @@ def run_guard(harness: "Harness", session_id: str, transcript: Any, cwd: Any, to
             inline = harness.inline_reset and not launch_id
             if inline:
                 state["opening_pending"] = opening_prompt(receipt)
+            successor: Optional[str] = None
+            if state.get("successor"):
+                log_event("successor_exists", harness=harness.name, session=session_id, successor=state["successor"])
+            elif not launch_id and not inline:
+                try:
+                    successor = harness.spawn_successor(opening_prompt(receipt),
+                                                        harness.successor_cwd(cwd, transcript, env), env)
+                except Exception as exc:        # a failed successor must not break the hook
+                    debug(f"successor failed: {exc!r}")
+                    log_event("successor_failed", harness=harness.name, session=session_id, error=repr(exc)[:200])
+                if successor:
+                    state["successor"] = successor
             save_state(state)
             log_event("receipt", harness=harness.name, session=session_id, tokens=tokens, receipt=str(receipt_file),
-                      handoff=str(handoff), launch_id=launch_id, inline=inline)
-            return {"action": "receipt", "receipt": receipt, "inline": inline, "opening": opening_prompt(receipt)}
+                      handoff=str(handoff), launch_id=launch_id, inline=inline, successor=successor)
+            return {"action": "receipt", "receipt": receipt, "inline": inline, "opening": opening_prompt(receipt),
+                    "successor": successor}
         state["last_outcome"] = "handoff_rejected: " + problem
         save_state(state)
         log_event("handoff_rejected", harness=harness.name, session=session_id, tokens=tokens, problem=problem, handoff=str(handoff))
@@ -840,6 +853,17 @@ class Harness:
 
     def user_message_after(self, transcript: Any, since: float) -> bool:
         return user_message_after(transcript, since)
+
+    # -- successor --------------------------------------------------------------
+    def spawn_successor(self, opening: str, cwd: Optional[str], env: Dict[str, str]) -> Optional[str]:
+        """No launcher owns this session and the harness cannot reset in place: start a fresh session
+        elsewhere that carries the opening prompt. Returns an identifier, or None when not supported /
+        not opted in. The old session is left alone (it may still be in use)."""
+        return None
+
+    def successor_cwd(self, cwd: Any, transcript: Any, env: Dict[str, str]) -> Optional[str]:
+        """Where a successor starts. Default: the directory the hook ran in."""
+        return str(cwd) if cwd else None
 
     # -- hook output ------------------------------------------------------------
     def format_block(self, text: str) -> Dict[str, Any]:
@@ -975,6 +999,70 @@ class ClaudeHarness(Harness):
                 return str(candidate)
             return found
         raise FileNotFoundError("claude is not on PATH")
+
+    REMOTE_CONTROL_FLAGS = ("--remote-control", "--rc")
+    SUCCESSOR_ENV = "REVERIFY_ROLLOVER_SUCCESSOR"          # "bg" -> `claude --bg <opening>` on each receipt
+    PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"                 # hook environment: the project the session was started in
+    # identity of the session the hook runs in; the successor must not inherit it
+    SESSION_IDENTITY_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_JOB_DIR",
+                            "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
+                            "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_PID", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
+
+    def successor_command(self, opening: str, env: Dict[str, str]) -> List[str]:
+        """`claude --bg` with the job's own respawn flags (model, effort, permission mode) when the hook
+        runs inside a background job, then the opening prompt."""
+        flags: List[str] = []
+        job_dir = env.get("CLAUDE_JOB_DIR")
+        if job_dir:
+            state = _read_json(Path(job_dir) / "state.json") or {}
+            respawn = state.get("respawnFlags")
+            if isinstance(respawn, list) and all(isinstance(f, str) for f in respawn):
+                flags = [f for f in respawn if f != "--reply-on-resume"]
+        return [self.resolve_exe(), "--bg", *flags, opening]
+
+    def successor_cwd(self, cwd: Any, transcript: Any, env: Dict[str, str]) -> Optional[str]:
+        """The successor must start in the project the old session belongs to, not wherever a `cd`
+        inside that session left the hook. Claude Code keys trust and MCP approvals per project
+        directory, so a `claude --bg` started in an unapproved sub-directory sits at "new MCP servers
+        need approval" and never runs (measured 2026-09-06). CLAUDE_PROJECT_DIR from the hook
+        environment wins; else the ancestor of cwd whose slug names the transcript's project folder;
+        else cwd."""
+        root = env.get(self.PROJECT_DIR_ENV)
+        if root and Path(root).is_dir():
+            return str(root)
+        if cwd and transcript:
+            want = Path(str(transcript)).parent.name
+            here = Path(str(cwd))
+            for candidate in (here, *here.parents):
+                if claude_project_slug(str(candidate)) == want:
+                    return str(candidate)
+        return str(cwd) if cwd else None
+
+    def spawn_successor(self, opening: str, cwd: Optional[str], env: Dict[str, str]) -> Optional[str]:
+        if str(env.get(self.SUCCESSOR_ENV, "")).strip().lower() != "bg":
+            return None
+        clean = {k: v for k, v in env.items() if k not in self.SESSION_IDENTITY_ENV}
+        cmd = self.successor_command(opening, env)
+        proc = subprocess.run(cmd, cwd=cwd or None, env=clean, capture_output=True, timeout=90)
+        raw = (proc.stdout or b"") + (proc.stderr or b"")
+        text = re.sub(r"\x1b\[[0-9;]*m", "", raw.decode("utf-8", "replace"))
+        match = re.search(r"backgrounded[^0-9a-f]*([0-9a-f]{6,})", text)
+        if proc.returncode != 0 and not match:
+            raise RuntimeError(f"claude --bg exited {proc.returncode}: {text.strip()[:200]}")
+        return match.group(1) if match else "bg"
+
+    def launch_args(self, args: List[str], opening: Optional[str]) -> List[str]:
+        """`claude --remote-control [name]` takes an optional name, so a bare flag followed by the opening
+        prompt would register the prompt as the session's name. Give the flag a name when the user did not."""
+        args = list(args)
+        for flag in self.REMOTE_CONTROL_FLAGS:
+            if flag not in args:
+                continue
+            idx = args.index(flag)
+            following = args[idx + 1] if idx + 1 < len(args) else None
+            if following is None or following.startswith("-"):
+                args.insert(idx + 1, f"{Path.cwd().name or 'reverify'} rollover")
+        return args + ([opening] if opening else [])
 
     def apply_settings(self, settings: Dict[str, Any], threshold: Optional[str], step: Optional[str],
                        disable_autocompact: bool) -> Dict[str, Any]:
@@ -1858,8 +1946,64 @@ def _hooks_of(container: Any, events: Iterable[str]) -> Dict[str, Optional[str]]
     return found
 
 
+def unconsumed_receipts(harness_name: str) -> Dict[str, Any]:
+    """Receipts issued to sessions that neither a launcher nor an in-place reset followed up on.
+
+    Each one is a hand-off that was written for nothing: the session kept running past the threshold.
+    """
+    info: Dict[str, Any] = {"count": 0, "peak": None, "last_at": None, "last_session": None}
+    path = state_dir() / "events.jsonl"
+    if not path.is_file():
+        return info
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return info
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("event") != "receipt" or event.get("harness") != harness_name:
+            continue
+        if event.get("launch_id") or event.get("inline") or event.get("successor"):
+            continue
+        info["count"] += 1
+        tokens = event.get("tokens")
+        if isinstance(tokens, int) and (info["peak"] is None or tokens > info["peak"]):
+            info["peak"] = tokens
+        info["last_at"] = event.get("at")
+        info["last_session"] = event.get("session")
+    return info
+
+
+def claude_project_slug(path: str) -> str:
+    """Claude Code names ``~/.claude/projects/<slug>`` after the project path with every character that
+    is not an ASCII letter or digit replaced by ``-`` (``C:\\逆向專案`` -> ``C------``)."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def successor_jobs() -> Dict[str, Any]:
+    """Claude Code background jobs the guard started as successors (their opening prompt carries the
+    rollover marker): the ones that never got going, and a count of the rest."""
+    info: Dict[str, Any] = {"blocked": [], "other": 0}
+    jobs = home_dir() / ".claude" / "jobs"
+    if not jobs.is_dir():
+        return info
+    for state_file in sorted(jobs.glob("*/state.json")):
+        state = _read_json(state_file) or {}
+        if not str(state.get("intent") or "").startswith("[rollover]"):
+            continue
+        if state.get("state") == "blocked":
+            info["blocked"].append({"id": state_file.parent.name, "detail": str(state.get("detail") or "blocked"),
+                                    "cwd": str(state.get("cwd") or "")})
+        else:
+            info["other"] += 1
+    return info
+
+
 def doctor_report() -> List[Dict[str, Any]]:
-    """Per harness: on PATH, hooks wired, commands resolvable, native compaction off."""
+    """Per harness: on PATH, hooks wired, commands resolvable, native compaction off, receipts consumed."""
     rows: List[Dict[str, Any]] = []
     for name in HARNESSES:
         harness = get_harness(name)
@@ -1899,6 +2043,25 @@ def doctor_report() -> List[Dict[str, Any]]:
                 ok, why = _command_resolves(command)
                 if not ok:
                     row["problems"].append(f"{event}: {why}")
+        unconsumed = unconsumed_receipts(name)
+        row["unconsumed_receipts"] = unconsumed
+        if unconsumed["count"]:
+            row["problems"].append(
+                f"{unconsumed['count']} hand-off receipt(s) went to sessions the launcher did not start "
+                f"(peak {fmt_k(unconsumed['peak'])}, last {unconsumed['last_at']}); nothing ended those sessions, so with "
+                f"native compaction off they kept growing. Start the CLI through `reverify rollover {name}` "
+                "(add --remote-control to keep phone/web access) so a fresh session actually follows each hand-off"
+                + (", or set REVERIFY_ROLLOVER_SUCCESSOR=bg in settings.json `env` so each receipt starts a fresh "
+                   "`claude --bg` session carrying the hand-off." if name == "claude" else "."))
+        if name == "claude":
+            jobs = successor_jobs()
+            row["successor_jobs"] = jobs
+            for job in jobs["blocked"]:
+                row["problems"].append(
+                    f"successor session {job['id']} never started: {job['detail']} (started in {job['cwd'] or '?'}). "
+                    "Claude Code keys trust and MCP approvals per project directory: run `claude` once in that "
+                    "directory and approve, or set `enableAllProjectMcpServers: true` in settings.json, then "
+                    f"`claude respawn {job['id']}` — or `claude rm {job['id']}` if the hand-off was already picked up.")
         rows.append(row)
     return rows
 
@@ -1926,7 +2089,14 @@ def run_doctor(argv: List[str]) -> int:
 
 INSTRUCTIONS_SNIPPET = """## Context rollover (reverify)
 
-State lives in files; the conversation is a cache. Built-in compaction is off.
+State lives in files; the conversation is a cache. Built-in compaction is off, so keep the
+conversation lean: what never enters it cannot bloat it.
+- Bulky output goes to files, not into the conversation: cap command output, write scripts to
+  disk instead of long inline heredocs, keep the path so it can be re-read, and read back only
+  the part you need. Read an image or a large file once.
+- Edit in place instead of rewriting whole files; a whole-file rewrite stays in context for the
+  rest of the session.
+- Send exploration and bulk verification to a subagent and keep only its conclusion.
 - At the start of a session, if a line says "rollover hand-off pending", read that file first,
   then pull details on demand from the memory index it points to.
 - Write conclusions into memory/notes files as you reach milestones; do not wait to be asked.

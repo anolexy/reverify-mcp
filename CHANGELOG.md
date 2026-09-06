@@ -6,6 +6,30 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- **Lean, not just cleared.** The `instructions` snippet and the README now state the honest
+  contract for a plain `claude` / `codex` session: keep the conversation lean (bulky output to
+  re-readable files, local edits, subagents for exploration) and keep the hand-off current; a fresh
+  session follows only where the CLI lets a hook do it, or where the launcher / successor does.
+- **`reverify rollover doctor` reports hand-offs nobody consumed.** A receipt whose session was not
+  started by the launcher (desktop app, `claude --bg`, Remote Control server mode, a plain `claude`)
+  used to look fine while the session kept growing with native compaction off — one measured
+  session reached 909k tokens. Doctor now counts those receipts per harness, shows the peak, and
+  names the two remedies.
+- **Successor sessions for Claude Code without the launcher** (`REVERIFY_ROLLOVER_SUCCESSOR=bg`):
+  on each receipt the guard starts `claude --bg <opening prompt>` with the job's own model / effort /
+  permission flags, so a fresh session carrying the hand-off appears in the session list. The old
+  session is left alone; nothing is resumed or rewritten. Opt-in.
+- **Successors start in the old session's project directory** (`CLAUDE_PROJECT_DIR` from the hook
+  environment, else the ancestor of the hook's cwd that names the transcript's project folder), not
+  wherever a `cd` inside the old session left the hook. Claude Code keys trust and MCP approvals per
+  project directory, and the first real successor, started in a sub-directory, sat at "2 new MCP
+  servers need approval" and never ran. `doctor` now lists successor jobs that never started, with
+  the remedy. The test suites clear the opt-in from the environment first: run inside a Claude Code
+  session (whose settings `env` reaches every shell), a receipt in a test used to start a real
+  `claude --bg` session.
+- **Launcher + Remote Control**: `reverify rollover claude --remote-control` gives the flag a name
+  when you did not, so the opening prompt is never registered as the session's name.
+
 - **Reconstruction re-executability benchmark** (`benchmarks/reconstructions.py` + corpus
   `corpus/reconstructions.jsonl`, built by `build_reconstructions.py`): 12 functions, each with a
   faithful reconstruction and one carrying a plausible decompilation mistake (swapped operator,

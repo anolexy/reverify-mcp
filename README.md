@@ -245,8 +245,12 @@ false accepts, and the second session started from the ledger, not from a summar
 ## Any agent CLI without compaction: `reverify rollover`
 
 The same rule applied to an interactive session — Claude Code, Codex CLI, Gemini CLI or
-OpenCode. Built-in compaction is turned off, and instead of a model-written summary the
-session is *replaced*:
+OpenCode. Built-in compaction is turned off; the model hands off to files, and instead of a
+model-written summary the session is *replaced* wherever the CLI lets a hook do that (Gemini
+CLI, OpenCode) or a launcher owns the process. Where it does not (a plain `claude` or `codex`),
+reverify keeps the context *lean* rather than pretending to clear it: bulky tool output goes to
+files that stay re-readable, edits stay local, exploration goes to subagents, and the hand-off
+is always current. We are asking those vendors for the missing primitive.
 
 ```bash
 pip install reverify
@@ -264,6 +268,18 @@ reverify rollover codex --full-auto
 reverify rollover instructions --write AGENTS.md   # optional: the protocol paragraph for the model
 ```
 
+- **A session nobody can end keeps growing — check `doctor`.** The hooks can write the hand-off
+  but cannot end a Claude Code or Codex session. If you start the CLI yourself, or through the
+  desktop app, a background job (`claude --bg`), or Remote Control server mode, the hand-off is
+  written and nothing follows it: with native compaction off the conversation has no ceiling (one
+  measured session reached 909k tokens before its owner noticed). `reverify rollover doctor` now
+  reports receipts that no launcher consumed. Either start the CLI through the launcher
+  (`reverify rollover claude --remote-control` keeps phone/web access through Remote Control), or
+  set `REVERIFY_ROLLOVER_SUCCESSOR=bg` in `~/.claude/settings.json` → `env`: every receipt then
+  starts a fresh `claude --bg` session that opens with the hand-off and appears in your session
+  list, and you switch to it. Neither route resumes or rewrites the old transcript. The successor
+  starts in the old session's project directory (Claude Code keys trust and MCP approvals per
+  project), and `doctor` names a successor that is stuck waiting on an approval.
 - **Small windows stay safe.** Native compaction is off, so when the harness records the
   model's context window (Codex does) the threshold is capped at 75% of it and the hand-off is
   refreshed more often.

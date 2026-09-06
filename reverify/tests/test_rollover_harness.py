@@ -75,7 +75,10 @@ class Base(unittest.TestCase):
         self._env = dict(os.environ)
         os.environ[rh.ENV_HOME] = str(self.home)
         os.environ[rh.ENV_STATE_DIR] = str(self.root / "state")
-        for key in (rh.ENV_TOKENS, rh.ENV_STEP, rh.ENV_LAUNCH_ID, rh.ENV_SETTINGS, "OPENCODE_CONFIG_DIR", "OPENCODE_DB") + rh.SESSION_ENV_VARS:
+        # the successor opt-in reaches every shell started inside a Claude Code session (settings.json `env`);
+        # with it set, a receipt in these tests would start a real `claude --bg` session
+        for key in (rh.ENV_TOKENS, rh.ENV_STEP, rh.ENV_LAUNCH_ID, rh.ENV_SETTINGS, "OPENCODE_CONFIG_DIR", "OPENCODE_DB",
+                    rh.ClaudeHarness.SUCCESSOR_ENV) + rh.SESSION_ENV_VARS:
             os.environ.pop(key, None)
 
     def tearDown(self):
@@ -442,6 +445,175 @@ class DoctorAndInstructions(Base):
             code = rh.run_doctor([])
         self.assertIn("threshold  :", out.getvalue())
         self.assertIn("claude", out.getvalue())
+
+    def test_doctor_flags_receipts_no_launcher_consumed(self):
+        os.environ[rh.ENV_SETTINGS] = str(self.root / "settings.json")
+        with redirect_stdout(io.StringIO()):
+            rh.run_install(["--harness", "claude"])
+        events = rh.state_dir() / "events.jsonl"
+        events.parent.mkdir(parents=True, exist_ok=True)
+        events.write_text("\n".join([
+            json.dumps({"at": "2026-09-04T17:53:28Z", "event": "receipt", "harness": "claude", "session": "s1",
+                        "tokens": 371615, "launch_id": None, "inline": False}),
+            json.dumps({"at": "2026-09-05T07:50:14Z", "event": "receipt", "harness": "claude", "session": "s1",
+                        "tokens": 815959, "launch_id": None, "inline": False}),
+            json.dumps({"at": "2026-09-05T08:00:00Z", "event": "receipt", "harness": "claude", "session": "s2",
+                        "tokens": 205000, "launch_id": "abc", "inline": False}),          # consumed by a launcher
+            json.dumps({"at": "2026-09-05T08:10:00Z", "event": "receipt", "harness": "gemini", "session": "g1",
+                        "tokens": 210000, "launch_id": None, "inline": True}),            # inline reset: fine
+            "not json",
+        ]) + "\n", encoding="utf-8")
+        rows = {r["harness"]: r for r in rh.doctor_report()}
+        self.assertEqual(rows["claude"]["unconsumed_receipts"]["count"], 2)
+        self.assertEqual(rows["claude"]["unconsumed_receipts"]["peak"], 815959)
+        problem = " ".join(rows["claude"]["problems"])
+        self.assertIn("launcher did not start", problem)
+        self.assertIn("816k", problem)
+        self.assertIn("reverify rollover claude", problem)
+        self.assertEqual(rows["gemini"]["unconsumed_receipts"]["count"], 0)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(rh.run_doctor([]), 1)
+        self.assertIn("launcher did not start", out.getvalue())
+
+    def test_claude_successor_uses_job_respawn_flags_and_strips_session_identity(self):
+        harness = rh.ClaudeHarness()
+        job = self.root / "job"
+        job.mkdir()
+        (job / "state.json").write_text(json.dumps({"respawnFlags": ["--reply-on-resume", "--effort", "low", "--model", "m"]}),
+                                        encoding="utf-8")
+        original_resolve = rh.ClaudeHarness.resolve_exe
+        rh.ClaudeHarness.resolve_exe = lambda self: "/bin/claude"
+        calls = []
+
+        class Done:
+            returncode = 0
+            stdout = "backgrounded \u00b7 \x1b[36mdeadbeef\x1b[39m\n  claude attach deadbeef".encode("utf-8")
+            stderr = b""
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return Done()
+
+        original_run = rh.subprocess.run
+        rh.subprocess.run = fake_run
+        try:
+            env = {"CLAUDE_JOB_DIR": str(job), "CLAUDE_CODE_SESSION_ID": "old", "CLAUDECODE": "1", "PATH": "x",
+                   rh.ClaudeHarness.SUCCESSOR_ENV: "bg"}
+            self.assertEqual(harness.successor_command("OPEN", env),
+                             ["/bin/claude", "--bg", "--effort", "low", "--model", "m", "OPEN"])
+            self.assertEqual(harness.spawn_successor("OPEN", str(self.cwd), env), "deadbeef")
+            cmd, kwargs = calls[0]
+            self.assertEqual(cmd[-1], "OPEN")
+            self.assertNotIn("CLAUDE_CODE_SESSION_ID", kwargs["env"])
+            self.assertNotIn("CLAUDECODE", kwargs["env"])
+            self.assertEqual(kwargs["env"]["PATH"], "x")
+            self.assertEqual(kwargs["cwd"], str(self.cwd))
+            # not opted in -> nothing spawned
+            self.assertIsNone(harness.spawn_successor("OPEN", None, {"CLAUDE_JOB_DIR": str(job)}))
+            self.assertEqual(len(calls), 1)
+        finally:
+            rh.subprocess.run = original_run
+            rh.ClaudeHarness.resolve_exe = original_resolve
+
+    def test_only_one_successor_per_session(self):
+        calls = []
+
+        class Fake(rh.Harness):
+            name = "claude"
+
+            def context_tokens(self, transcript, session_id):
+                return 250_000
+
+            def anchors(self, transcript, session_id):
+                return {}
+
+            def spawn_successor(self, opening, cwd, env):
+                calls.append(opening)
+                return f"succ{len(calls)}"
+
+        harness = Fake()
+        transcript = self.cwd / "t.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        env = {}
+        for _ in range(2):                                   # two full block -> receipt cycles
+            result = rh.run_guard(harness, "sess-1", str(transcript), str(self.cwd), 250_000, lambda: {}, env)
+            self.assertEqual(result["action"], "block")
+            time.sleep(1.1)
+            self.handoff.parent.mkdir(parents=True, exist_ok=True)
+            self.handoff.write_text(HANDOFF_OK, encoding="utf-8")
+            result = rh.run_guard(harness, "sess-1", str(transcript), str(self.cwd), 250_000, lambda: {}, env)
+            self.assertEqual(result["action"], "receipt")
+            state = rh.load_state("sess-1", 200_000)
+            state["next_trigger"] = 0                         # force the next cycle to fire again
+            rh.save_state(state)
+        self.assertEqual(calls, [calls[0]])                  # spawned once, not twice
+        self.assertEqual(rh.load_state("sess-1", 200_000)["successor"], "succ1")
+
+    def test_doctor_counts_receipt_with_successor_as_consumed(self):
+        events = rh.state_dir() / "events.jsonl"
+        events.parent.mkdir(parents=True, exist_ok=True)
+        events.write_text(json.dumps({"at": "2026-09-06T00:00:00Z", "event": "receipt", "harness": "claude",
+                                      "session": "s", "tokens": 205000, "launch_id": None, "inline": False,
+                                      "successor": "deadbeef"}) + "\n", encoding="utf-8")
+        self.assertEqual(rh.unconsumed_receipts("claude")["count"], 0)
+
+    def test_claude_successor_starts_in_the_old_sessions_project(self):
+        harness = rh.ClaudeHarness()
+        project = self.cwd
+        transcript = self.home / ".claude" / "projects" / rh.claude_project_slug(str(project)) / "sess.jsonl"
+        deep = project / "worktree" / "sub"                  # where a `cd` inside the old session left the hook
+        deep.mkdir(parents=True)
+        self.assertEqual(rh.claude_project_slug(r"C:\Users\u\AppData\Local\Temp\reverify-reset-sandbox"),
+                         "C--Users-u-AppData-Local-Temp-reverify-reset-sandbox")
+        # the hook environment names the project: that wins
+        self.assertEqual(harness.successor_cwd(str(deep), str(transcript), {"CLAUDE_PROJECT_DIR": str(project)}),
+                         str(project))
+        # no env: the ancestor whose slug names the transcript's project folder
+        self.assertEqual(harness.successor_cwd(str(deep), str(transcript), {}), str(project))
+        # a transcript of some other project: fall back to the hook's cwd
+        other = self.home / ".claude" / "projects" / "elsewhere" / "sess.jsonl"
+        self.assertEqual(harness.successor_cwd(str(deep), str(other), {}), str(deep))
+        self.assertIsNone(harness.successor_cwd(None, str(transcript), {}))
+        # the base harness keeps the hook's cwd
+        self.assertEqual(rh.Harness().successor_cwd(str(deep), str(transcript), {"CLAUDE_PROJECT_DIR": str(project)}),
+                         str(deep))
+
+    def test_doctor_flags_successor_job_that_never_started(self):
+        jobs = self.home / ".claude" / "jobs"
+        marker = "[rollover] This is a fresh session that continues the previous one"
+        for job_id, state in (("8cbdefe0", {"state": "blocked", "detail": "2 new MCP servers need approval",
+                                            "cwd": str(self.cwd / "worktree"), "intent": marker}),
+                              ("24056d0d", {"state": "working", "detail": "reading the hand-off",
+                                            "cwd": str(self.cwd), "intent": marker}),
+                              ("feabbd57", {"state": "blocked", "detail": "unrelated", "intent": "fix the tests"})):
+            (jobs / job_id).mkdir(parents=True)
+            (jobs / job_id / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        info = rh.successor_jobs()
+        self.assertEqual([j["id"] for j in info["blocked"]], ["8cbdefe0"])
+        self.assertEqual(info["other"], 1)
+        os.environ[rh.ENV_SETTINGS] = str(self.root / "settings.json")
+        with redirect_stdout(io.StringIO()):
+            rh.run_install(["--harness", "claude"])
+        rows = {r["harness"]: r for r in rh.doctor_report()}
+        problem = " ".join(rows["claude"]["problems"])
+        self.assertIn("successor session 8cbdefe0 never started: 2 new MCP servers need approval", problem)
+        self.assertIn("claude respawn 8cbdefe0", problem)
+        self.assertNotIn("24056d0d", problem)
+        self.assertNotIn("successor_jobs", rows["gemini"])
+
+    def test_claude_launch_args_keep_opening_prompt_out_of_remote_control_name(self):
+        harness = rh.ClaudeHarness()
+        bare = harness.launch_args(["--remote-control"], "OPENING")
+        self.assertEqual(bare[0], "--remote-control")
+        self.assertNotEqual(bare[1], "OPENING")          # a generated name sits between flag and prompt
+        self.assertEqual(bare[-1], "OPENING")
+        named = harness.launch_args(["--rc", "My box"], "OPENING")
+        self.assertEqual(named, ["--rc", "My box", "OPENING"])
+        before_flag = harness.launch_args(["--remote-control", "--verbose"], None)
+        self.assertEqual(before_flag[0], "--remote-control")
+        self.assertEqual(before_flag[2], "--verbose")
+        self.assertEqual(harness.launch_args(["--verbose"], "OPENING"), ["--verbose", "OPENING"])
 
     def test_instructions_snippet_prints_and_appends_once(self):
         out = io.StringIO()

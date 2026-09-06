@@ -68,7 +68,9 @@ class Base(unittest.TestCase):
         self.state = self.root / "state"
         self._env = dict(os.environ)
         os.environ[cr.ENV_STATE_DIR] = str(self.state)
-        for key in (cr.ENV_TOKENS, cr.ENV_STEP, cr.ENV_LAUNCH_ID, cr.ENV_SESSION):
+        # REVERIFY_ROLLOVER_SUCCESSOR reaches every shell started inside a Claude Code session (settings.json
+        # `env`); with it set, a receipt in these tests would start a real `claude --bg` session.
+        for key in (cr.ENV_TOKENS, cr.ENV_STEP, cr.ENV_LAUNCH_ID, cr.ENV_SESSION, "REVERIFY_ROLLOVER_SUCCESSOR"):
             os.environ.pop(key, None)
 
     def tearDown(self):
