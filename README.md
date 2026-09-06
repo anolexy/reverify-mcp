@@ -19,12 +19,6 @@
   </a>
 </p>
 
-<p align="center">
-  <a href="https://dartnode.com" title="Powered by DartNode - Free VPS for Open Source">
-    <img src="https://dartnode.com/branding/DN-Open-Source-sm.png" alt="Powered by DartNode" />
-  </a>
-</p>
-
 AI is confident and often wrong: it invents an API, a struct field, an offset, or what a
 function does, and says it like fact. Reverify makes a deterministic tool the judge — the model
 proposes a claim, the tool checks it against the actual artifact, and it comes back **VERIFIED /
