@@ -35,8 +35,15 @@ All notable changes to this project are documented here.
   `run --attach`) the TUI "new session" command answers without doing anything, so the plugin waits
   for the new session briefly and creates it itself when none appears, and the successor is
   prompted with the old session's model rather than the server default.
+- **OpenCode config dir resolved the way opencode resolves it** (`OPENCODE_CONFIG_DIR`, else
+  `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`), and `doctor` says when that directory cannot
+  be read at all. On one Windows machine `~/.config` had lost its ACL: opencode itself died at start-up
+  with `EEXIST`, while doctor only said "plugin: not installed". The install failure hint now names
+  `XDG_CONFIG_HOME` — the variable opencode needs to start past an unreadable `~/.config`;
+  `OPENCODE_CONFIG_DIR` alone is honoured for the plugin but does not get opencode running.
 - **`doctor` shows the successor state** (`successor: on|off` on the Claude row) and, once it is on,
-  reports earlier receipts that had no successor as a note instead of a failure.
+  reports earlier receipts that had no successor as a note instead of a failure. Its exit code now
+  counts a harness whose hooks are installed even when the CLI is not on the shell's PATH.
 - **Launcher + Remote Control**: `reverify rollover claude --remote-control` gives the flag a name
   when you did not, so the opening prompt is never registered as the session's name.
 

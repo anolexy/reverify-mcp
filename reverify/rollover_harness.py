@@ -1353,8 +1353,35 @@ class OpenCodeHarness(Harness):
 
     @staticmethod
     def config_dir() -> Path:
+        # the order opencode itself uses: OPENCODE_CONFIG_DIR, else $XDG_CONFIG_HOME/opencode, else ~/.config/opencode
         override = os.environ.get("OPENCODE_CONFIG_DIR")
-        return Path(override) if override else home_dir() / ".config" / "opencode"
+        if override:
+            return Path(override)
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        if xdg:
+            return Path(xdg) / "opencode"
+        return home_dir() / ".config" / "opencode"
+
+    @classmethod
+    def config_dir_problem(cls) -> Optional[str]:
+        """Why opencode cannot use its config dir at all, or None.
+
+        A directory that exists but cannot be listed is worse than a missing plugin: opencode itself dies at
+        start-up (``mkdir`` -> ``EEXIST`` on an unreadable ``~/.config``) and ``plugin_file().is_file()`` is
+        quietly False, so without this check doctor would only say "plugin: not installed".
+        """
+        path = cls.config_dir()
+        for candidate in (path, path.parent):
+            if not candidate.exists():
+                continue
+            try:
+                os.listdir(candidate)
+            except OSError as exc:
+                return (f"config dir not accessible: {candidate} ({exc.strerror or exc}); opencode itself cannot "
+                        "start until it is. Fix its permissions, or set XDG_CONFIG_HOME to a writable dir before "
+                        "starting opencode and before `reverify rollover install --harness opencode`")
+            return None
+        return None
 
     def config_file(self) -> Path:
         return self.config_dir() / "opencode.json"
@@ -1644,8 +1671,10 @@ def _selected_harnesses(argv: List[str]) -> List[Harness]:
 def _remedy(harness_name: str, exc: Exception) -> str:
     if harness_name == "opencode" and isinstance(exc, (PermissionError, OSError)):
         return ("opencode: FAILED — cannot write the config dir "
-                f"({OpenCodeHarness.config_dir()}): {exc}. Fix its permissions, or set OPENCODE_CONFIG_DIR "
-                "to a writable dir and re-run (export the same var before starting opencode).")
+                f"({OpenCodeHarness.config_dir()}): {exc}. Fix its permissions, or set XDG_CONFIG_HOME to a "
+                "writable dir and re-run with the same variable exported before starting opencode (opencode "
+                "needs it to start past an unreadable ~/.config; OPENCODE_CONFIG_DIR is honoured too, but on "
+                "its own does not get opencode running).")
     return f"{harness_name}: FAILED — {exc}"
 
 
@@ -2029,6 +2058,9 @@ def doctor_report() -> List[Dict[str, Any]]:
                 row["compaction_off"] = isinstance(model.get("compressionThreshold"), (int, float)) and model["compressionThreshold"] > 1
             else:
                 harness_oc = OpenCodeHarness()
+                blocked = OpenCodeHarness.config_dir_problem()
+                if blocked:
+                    row["problems"].append(blocked)
                 plugin = harness_oc.plugin_file()
                 row["hooks"] = {"plugin": str(plugin) if plugin.is_file() else None}
                 data = _load_json_file(harness_oc.config_file())
@@ -2103,7 +2135,12 @@ def run_doctor(argv: List[str]) -> int:
     missing = [r["harness"] for r in rows if r["on_path"] and (not r["hooks"] or not all(r["hooks"].values()))]
     if missing:
         print(f"to install : reverify rollover install --harness {','.join(missing)}")
-    return 0 if not any(r["problems"] for r in rows if r["on_path"]) else 1
+    # a harness counts when its CLI is on PATH or its hooks are installed: receipts and stuck successors
+    # are findings even on a machine where the CLI is not on this shell's PATH
+    def counts(r: Dict[str, Any]) -> bool:
+        return bool(r["on_path"] or (r["hooks"] and all(v for v in r["hooks"].values())))
+
+    return 0 if not any(r["problems"] for r in rows if counts(r)) else 1
 
 
 INSTRUCTIONS_SNIPPET = """## Context rollover (reverify)
