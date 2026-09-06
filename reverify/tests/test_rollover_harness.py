@@ -77,7 +77,7 @@ class Base(unittest.TestCase):
         os.environ[rh.ENV_STATE_DIR] = str(self.root / "state")
         # the successor opt-in reaches every shell started inside a Claude Code session (settings.json `env`);
         # with it set, a receipt in these tests would start a real `claude --bg` session
-        for key in (rh.ENV_TOKENS, rh.ENV_STEP, rh.ENV_LAUNCH_ID, rh.ENV_SETTINGS, "OPENCODE_CONFIG_DIR", "OPENCODE_DB",
+        for key in (rh.ENV_TOKENS, rh.ENV_STEP, rh.ENV_LAUNCH_ID, rh.ENV_SETTINGS, "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME", "OPENCODE_DB",
                     rh.ClaudeHarness.SUCCESSOR_ENV) + rh.SESSION_ENV_VARS:
             os.environ.pop(key, None)
 
@@ -715,9 +715,33 @@ class Selection(Base):
         self.assertEqual(code, 0)                        # claude succeeded -> overall success
         self.assertIn("claude: hooks", text)
         self.assertIn("opencode: FAILED", text)
+        self.assertIn("XDG_CONFIG_HOME", text)                # the variable opencode itself needs to start
         self.assertIn("OPENCODE_CONFIG_DIR", text)
         self.assertIn("failed: opencode", text)
         self.assertTrue((self.root / "settings.json").is_file())
+
+    def test_opencode_config_dir_resolves_like_opencode(self):
+        self.assertEqual(rh.OpenCodeHarness.config_dir(), self.home / ".config" / "opencode")
+        os.environ["XDG_CONFIG_HOME"] = str(self.root / "xdg")
+        self.assertEqual(rh.OpenCodeHarness.config_dir(), self.root / "xdg" / "opencode")
+        os.environ["OPENCODE_CONFIG_DIR"] = str(self.root / "explicit")
+        self.assertEqual(rh.OpenCodeHarness.config_dir(), self.root / "explicit")
+
+    def test_opencode_config_dir_problem_is_none_when_missing_or_listable(self):
+        self.assertIsNone(rh.OpenCodeHarness.config_dir_problem())           # nothing there yet
+        (self.home / ".config" / "opencode").mkdir(parents=True)
+        self.assertIsNone(rh.OpenCodeHarness.config_dir_problem())
+
+    def test_doctor_reports_an_opencode_config_dir_it_cannot_list(self):
+        # something exists where ~/.config should be and cannot be listed (here a plain file; on the machine
+        # that motivated this, a directory whose ACL was gone) -> opencode itself will not start
+        (self.home / ".config").write_text("in the way", encoding="utf-8")
+        problem = rh.OpenCodeHarness.config_dir_problem()
+        self.assertIsNotNone(problem)
+        self.assertIn("XDG_CONFIG_HOME", problem)
+        row = next(r for r in rh.doctor_report() if r["harness"] == "opencode")
+        self.assertTrue(any("config dir not accessible" in p for p in row["problems"]), row["problems"])
+        self.assertIn("plugin: not installed", row["problems"])
 
 
 if __name__ == "__main__":

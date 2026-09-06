@@ -304,7 +304,8 @@ reverify rollover instructions --write AGENTS.md   # optional: the protocol para
   `~/.claude/settings.json` (hooks, `autoCompactEnabled: false`); Codex `~/.codex/hooks.json`
   + `config.toml` (`[features] hooks = true`, a compaction limit no session reaches); Gemini
   `~/.gemini/settings.json` (hooks, `model.compressionThreshold` above 1); OpenCode
-  `~/.config/opencode/plugins/reverify-rollover.js` + `opencode.json` (`compaction.auto: false`).
+  `~/.config/opencode/plugins/reverify-rollover.js` + `opencode.json` (`compaction.auto: false`;
+  the directory follows `OPENCODE_CONFIG_DIR` / `XDG_CONFIG_HOME` exactly as opencode does).
 
 Compare with a compaction summary: the hand-off is written while the model still has the
 whole context, into a file with a fixed shape, separated from verified facts (memory files,
