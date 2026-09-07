@@ -152,14 +152,63 @@ class TestStateIntegrityAuditor(unittest.TestCase):
 
 
 class TestFullAudit(unittest.TestCase):
-    """Test end-to-end full audit report generation."""
+    """Test end-to-end full audit report generation.
+
+    ``env_snapshot`` is always passed explicitly here so these tests stay
+    deterministic regardless of what the ambient process environment (CI runner,
+    developer machine, ...) happens to contain — ``run_full_security_audit``
+    defaults to the real ``os.environ`` only when the caller (e.g. the live CLI)
+    doesn't supply a snapshot.
+    """
 
     def test_full_security_audit_run(self):
-        report = run_full_security_audit(str(Path(__file__).resolve().parent))
+        """A clean workspace and a secret-free environment snapshot audit as PASS."""
+        report = run_full_security_audit(
+            str(Path(__file__).resolve().parent),
+            env_snapshot={"HOME": "/home/user"},
+        )
         self.assertEqual(report["status"], "PASS")
         self.assertTrue(report["filesystem_audit"]["traversal_blocked"])
         self.assertTrue(len(report["network_audit"]) > 0)
+        self.assertEqual(report["environment_audit"]["secrets_detected"], 0)
         self.assertTrue(report["environment_audit"]["sanitized_safe"])
+
+    def test_full_security_audit_flags_leaked_secret(self):
+        """A snapshot with no OPENAI_API_KEY at all must not crash (regression test:
+        sanitized_safe used to be hardcoded to that one key's presence), and a real
+        secret under any other key must still be detected and redacted.
+        """
+        report = run_full_security_audit(
+            str(Path(__file__).resolve().parent),
+            env_snapshot={"DB_PASSWORD": "SuperSecretPassword123!"},
+        )
+        self.assertEqual(report["environment_audit"]["secrets_detected"], 1)
+        self.assertTrue(report["environment_audit"]["sanitized_safe"])
+
+    def test_full_security_audit_survives_malformed_target_url(self):
+        """A malformed IPv6-bracket literal makes urlparse(...).hostname raise
+        ValueError. The audit must still complete (not crash) and treat the
+        unparseable target as already handled by NetworkBoundaryAuditor's own
+        is_safe=False classification, not as a fatal error.
+        """
+        report = run_full_security_audit(
+            str(Path(__file__).resolve().parent),
+            target_urls=["http://[::1", "https://api.openai.com/v1"],
+            env_snapshot={},
+        )
+        self.assertEqual(len(report["network_audit"]), 2)
+        self.assertFalse(report["network_audit"][0]["is_safe"])
+
+    def test_full_security_audit_detects_dns_rebinding_target(self):
+        """Both a nip.io DNS-rebinding target and a benign URL classify correctly,
+        so the summary self-check must not flag a leak on either of them.
+        """
+        report = run_full_security_audit(
+            str(Path(__file__).resolve().parent),
+            target_urls=["http://attacker.127.0.0.1.nip.io/", "https://api.openai.com/v1"],
+            env_snapshot={},
+        )
+        self.assertEqual(report["status"], "PASS")
 
 
 if __name__ == "__main__":
